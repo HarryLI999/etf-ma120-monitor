@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -17,7 +18,12 @@ BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 DATA_DIR = Path("data")
 JSON_PATH = DATA_DIR / "latest.json"
 CSV_PATH = DATA_DIR / "latest.csv"
-KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+KLINE_URLS = [
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+]
+QUOTE_URL = "https://qt.gtimg.cn/q="
 
 ETFS = [
     ("512890", "红利低波ETF华泰柏瑞"),
@@ -58,111 +64,173 @@ def to_decimal(value: Any) -> Decimal:
         raise ValueError(f"无法转换价格: {value!r}") from exc
 
 
-def fetch_daily_kline(symbol: str, *, qfq: bool, count: int = 160) -> list[KlineRow]:
-    suffix = ",qfq" if qfq else ""
-    params = {"param": f"{symbol},day,,,{count}{suffix}"}
+def round4(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+
+def fetch_qfq_daily_kline(symbol: str, count: int = 180) -> list[KlineRow]:
+    """获取腾讯前复权日K线。
+
+    腾讯 fqkline 接口要求完整的6段参数：
+    代码,周期,开始日期,结束日期,数量,复权方式。
+    本函数始终使用 qfq，不再发送缺少第6段参数的不复权请求。
+    """
+    param_value = f"{symbol},day,,,{count},qfq"
     last_error: Exception | None = None
 
     for attempt in range(1, 4):
-        try:
-            response = requests.get(
-                KLINE_URL,
-                params=params,
-                headers=HEADERS,
-                timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json()
+        for url in KLINE_URLS:
+            try:
+                response = requests.get(
+                    url,
+                    params={"param": param_value},
+                    headers=HEADERS,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                payload = response.json()
 
-            if payload.get("code") != 0:
-                raise RuntimeError(f"腾讯接口返回异常: {payload.get('msg') or payload}")
+                if payload.get("code") != 0:
+                    raise RuntimeError(
+                        f"腾讯K线接口返回异常: {payload.get('msg') or payload}"
+                    )
 
-            security_data = (payload.get("data") or {}).get(symbol)
-            if not security_data:
-                raise RuntimeError(f"腾讯接口未返回 {symbol} 的行情")
+                security_data = (payload.get("data") or {}).get(symbol)
+                if not security_data:
+                    raise RuntimeError(f"腾讯K线接口未返回 {symbol} 的行情")
 
-            rows = (
-                security_data.get("qfqday")
-                or security_data.get("day")
-                or security_data.get("hfqday")
-            )
-            if not rows:
-                raise RuntimeError(f"腾讯接口未返回 {symbol} 的日K线")
+                rows = security_data.get("qfqday") or security_data.get("day")
+                if not rows:
+                    raise RuntimeError(f"腾讯K线接口未返回 {symbol} 的日K线")
 
-            parsed: list[KlineRow] = []
-            for row in rows:
-                if not isinstance(row, list) or len(row) < 3:
-                    continue
-                parsed.append(KlineRow(date=str(row[0]), close=to_decimal(row[2])))
+                parsed: list[KlineRow] = []
+                for row in rows:
+                    if not isinstance(row, list) or len(row) < 3:
+                        continue
+                    parsed.append(
+                        KlineRow(date=str(row[0]), close=to_decimal(row[2]))
+                    )
 
-            parsed.sort(key=lambda item: item.date)
-            if not parsed:
-                raise RuntimeError(f"{symbol} 日K线为空")
-            return parsed
+                parsed.sort(key=lambda item: item.date)
+                if len(parsed) < 120:
+                    raise RuntimeError(
+                        f"{symbol} 前复权日线仅有{len(parsed)}条，不足120条"
+                    )
+                return parsed
 
-        except (requests.RequestException, ValueError, RuntimeError, json.JSONDecodeError) as exc:
-            last_error = exc
-            print(f"{symbol} 第{attempt}次请求失败: {exc}")
-            if attempt < 3:
-                time.sleep(attempt * 5)
+            except (
+                requests.RequestException,
+                ValueError,
+                RuntimeError,
+                json.JSONDecodeError,
+            ) as exc:
+                last_error = exc
+                print(
+                    f"{symbol} 第{attempt}次请求失败，接口={url}，"
+                    f"param={param_value}，原因={exc}"
+                )
+
+        if attempt < 3:
+            time.sleep(attempt * 5)
 
     raise RuntimeError(f"{symbol} 连续3次请求失败: {last_error}")
 
 
-def round4(value: Decimal) -> Decimal:
-    return value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+def fetch_tencent_quote(symbol: str) -> tuple[Decimal | None, str | None, str]:
+    """读取腾讯实时快照，用于复核最新收盘价。
+
+    快照失败时不阻断主流程，主值仍采用前复权K线最新一日收盘价；
+    前复权序列的最新价理论上与实际收盘价一致。
+    """
+    try:
+        response = requests.get(
+            QUOTE_URL + symbol,
+            headers=HEADERS,
+            timeout=20,
+        )
+        response.raise_for_status()
+        response.encoding = "gbk"
+        text = response.text.strip()
+        match = re.search(r'="(.*)";', text)
+        if not match:
+            raise RuntimeError("腾讯快照返回格式无法识别")
+
+        fields = match.group(1).split("~")
+        if len(fields) < 31:
+            raise RuntimeError(f"腾讯快照字段不足: {len(fields)}")
+
+        price = to_decimal(fields[3]) if fields[3] else None
+        raw_time = fields[30] if fields[30] else ""
+        quote_date = raw_time[:8]
+        if len(quote_date) == 8 and quote_date.isdigit():
+            quote_date = f"{quote_date[:4]}-{quote_date[4:6]}-{quote_date[6:8]}"
+        else:
+            quote_date = None
+
+        return price, quote_date, "腾讯财经实时快照"
+    except Exception as exc:  # 快照只做复核，不影响K线主流程
+        return None, None, f"腾讯快照复核失败: {type(exc).__name__}: {exc}"
 
 
 def calculate_one(code: str, name: str, target_date: str) -> dict[str, Any]:
     symbol = market_symbol(code)
     try:
-        raw_rows = fetch_daily_kline(symbol, qfq=False)
-        qfq_rows = fetch_daily_kline(symbol, qfq=True)
+        qfq_rows = fetch_qfq_daily_kline(symbol)
+        latest = qfq_rows[-1]
 
-        raw_latest = raw_rows[-1]
-        qfq_latest = qfq_rows[-1]
-
-        if raw_latest.date != target_date or qfq_latest.date != target_date:
+        if latest.date != target_date:
             return {
                 "ETF代码": code,
                 "ETF名称": name,
-                "交易日期": raw_latest.date,
+                "交易日期": latest.date,
                 "ETF现价": None,
                 "MA120": None,
                 "现价/MA120": None,
                 "状态": "not_updated",
                 "说明": (
-                    f"最新行情日期为{raw_latest.date}，目标日期为{target_date}；"
+                    f"最新K线日期为{latest.date}，目标日期为{target_date}；"
                     "可能为休市日或盘后数据尚未更新"
                 ),
             }
 
-        if len(qfq_rows) < 120:
-            raise RuntimeError(f"前复权日线仅有{len(qfq_rows)}条，不足120条")
-
-        current_close = raw_latest.close
         recent_120 = qfq_rows[-120:]
+        kline_close = latest.close
         ma120 = sum((row.close for row in recent_120), Decimal("0")) / Decimal("120")
-        ratio = current_close / ma120
-        qfq_last_close = qfq_latest.close
-        difference = abs(current_close - qfq_last_close)
 
-        note = "腾讯不复权收盘价与前复权序列末日收盘价一致"
-        if difference > Decimal("0.001"):
-            note = f"两种口径末日价格差{round4(difference)}，现价采用不复权收盘价"
+        quote_price, quote_date, quote_note = fetch_tencent_quote(symbol)
+        final_close = kline_close
+        notes = [
+            "MA120采用腾讯财经最近120个交易日前复权收盘价算术平均值",
+            "前复权序列最新一日价格作为当日收盘价主值",
+        ]
+
+        if quote_price is not None and quote_date == target_date:
+            difference = abs(quote_price - kline_close)
+            if difference <= Decimal("0.001"):
+                final_close = quote_price
+                notes.append("腾讯实时快照与K线末日收盘价一致，采用快照价")
+            else:
+                notes.append(
+                    f"腾讯快照价{round4(quote_price)}与K线价{round4(kline_close)}"
+                    f"相差{round4(difference)}，最终采用K线收盘价"
+                )
+        else:
+            notes.append(quote_note)
+
+        ratio = final_close / ma120
 
         return {
             "ETF代码": code,
             "ETF名称": name,
             "交易日期": target_date,
-            "ETF现价": float(round4(current_close)),
+            "ETF现价": float(round4(final_close)),
             "MA120": float(round4(ma120)),
             "现价/MA120": float(round4(ratio)),
             "状态": "ok",
-            "说明": note,
+            "说明": "；".join(notes),
         }
 
-    except Exception as exc:  # 保留单只ETF错误，不影响其他标的
+    except Exception as exc:
         return {
             "ETF代码": code,
             "ETF名称": name,
@@ -185,23 +253,40 @@ def write_outputs(results: list[dict[str, Any]], target_date: str) -> None:
     payload = {
         "交易日期": target_date,
         "生成时间": generated_at,
-        "数据来源": "腾讯财经日K线接口",
-        "计算口径": "ETF现价采用当日不复权收盘价；MA120采用截至当日最近120个交易日前复权收盘价的算术平均值",
+        "数据来源": "腾讯财经前复权日K线；腾讯实时快照用于收盘价复核",
+        "计算口径": (
+            "ETF现价优先采用与日K一致的腾讯实时快照收盘价；"
+            "MA120采用截至当日最近120个交易日前复权收盘价的算术平均值"
+        ),
         "成功数量": len(success),
         "失败数量": len(failed),
         "data": ordered,
     }
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    JSON_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    JSON_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
-    fields = ["ETF代码", "ETF名称", "交易日期", "ETF现价", "MA120", "现价/MA120", "状态", "说明"]
+    fields = [
+        "ETF代码",
+        "ETF名称",
+        "交易日期",
+        "ETF现价",
+        "MA120",
+        "现价/MA120",
+        "状态",
+        "说明",
+    ]
     with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(ordered)
 
-    print(f"已写入 {JSON_PATH} 和 {CSV_PATH}，成功{len(success)}只，失败{len(failed)}只。")
+    print(
+        f"已写入 {JSON_PATH} 和 {CSV_PATH}，"
+        f"成功{len(success)}只，失败{len(failed)}只。"
+    )
     for item in ordered:
         print(item)
 
@@ -223,9 +308,12 @@ def main() -> int:
         for item in results:
             print(item)
         if error_count > 0:
-            print("所有ETF均获取失败，工作流标记为失败，避免出现‘成功但无数据’。")
+            print("所有ETF均获取失败，工作流标记为失败。")
             return 1
-        print(f"所有ETF均无{target_date}行情，视为休市或数据尚未更新，不覆盖旧结果。")
+        print(
+            f"所有ETF均无{target_date}行情，视为休市或数据尚未更新，"
+            "不覆盖旧结果。"
+        )
         return 0
 
     write_outputs(results, target_date)
