@@ -25,15 +25,16 @@ KLINE_URLS = [
 ]
 QUOTE_URL = "https://qt.gtimg.cn/q="
 
+# 固定汇报顺序及每只ETF对应的均线周期。
 ETFS = [
-    ("512890", "红利低波ETF华泰柏瑞"),
-    ("515450", "红利低波50ETF南方"),
-    ("159307", "红利低波100ETF博时"),
-    ("515080", "中证红利ETF招商"),
-    ("561580", "央企红利ETF华泰柏瑞"),
-    ("159758", "红利质量ETF华夏"),
-    ("159545", "恒生红利低波ETF易方达"),
-    ("513910", "港股通央企红利ETF华夏"),
+    ("512890", "红利低波ETF华泰柏瑞", 130),
+    ("515080", "中证红利ETF招商", 62),
+    ("515450", "红利低波50ETF南方", 65),
+    ("159758", "红利质量ETF华夏", 108),
+    ("561580", "央企红利ETF华泰柏瑞", 119),
+    ("513910", "港股通央企红利ETF华夏", 55),
+    ("159545", "恒生红利低波ETF易方达", 52),
+    ("159307", "红利低波100ETF博时", 101),
 ]
 
 HEADERS = {
@@ -68,14 +69,10 @@ def round4(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
-def fetch_qfq_daily_kline(symbol: str, count: int = 180) -> list[KlineRow]:
-    """获取腾讯前复权日K线。
-
-    腾讯 fqkline 接口要求完整的6段参数：
-    代码,周期,开始日期,结束日期,数量,复权方式。
-    本函数始终使用 qfq，不再发送缺少第6段参数的不复权请求。
-    """
-    param_value = f"{symbol},day,,,{count},qfq"
+def fetch_qfq_daily_kline(symbol: str, required_count: int) -> list[KlineRow]:
+    """获取腾讯前复权日K线，并确保数据数量满足指定均线周期。"""
+    request_count = max(required_count + 40, 180)
+    param_value = f"{symbol},day,,,{request_count},qfq"
     last_error: Exception | None = None
 
     for attempt in range(1, 4):
@@ -112,9 +109,10 @@ def fetch_qfq_daily_kline(symbol: str, count: int = 180) -> list[KlineRow]:
                     )
 
                 parsed.sort(key=lambda item: item.date)
-                if len(parsed) < 120:
+                if len(parsed) < required_count:
                     raise RuntimeError(
-                        f"{symbol} 前复权日线仅有{len(parsed)}条，不足120条"
+                        f"{symbol} 前复权日线仅有{len(parsed)}条，"
+                        f"不足MA{required_count}所需的{required_count}条"
                     )
                 return parsed
 
@@ -137,11 +135,7 @@ def fetch_qfq_daily_kline(symbol: str, count: int = 180) -> list[KlineRow]:
 
 
 def fetch_tencent_quote(symbol: str) -> tuple[Decimal | None, str | None, str]:
-    """读取腾讯实时快照，用于复核最新收盘价。
-
-    快照失败时不阻断主流程，主值仍采用前复权K线最新一日收盘价；
-    前复权序列的最新价理论上与实际收盘价一致。
-    """
+    """读取腾讯实时快照；快照失败时允许使用同日K线收盘价。"""
     try:
         response = requests.get(
             QUOTE_URL + symbol,
@@ -168,96 +162,136 @@ def fetch_tencent_quote(symbol: str) -> tuple[Decimal | None, str | None, str]:
             quote_date = None
 
         return price, quote_date, "腾讯财经实时快照"
-    except Exception as exc:  # 快照只做复核，不影响K线主流程
-        return None, None, f"腾讯快照复核失败: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return None, None, f"腾讯快照获取失败: {type(exc).__name__}: {exc}"
 
 
-def calculate_one(code: str, name: str, target_date: str) -> dict[str, Any]:
+def empty_result(
+    code: str,
+    name: str,
+    ma_period: int,
+    trade_date: str | None,
+    status: str,
+    note: str,
+) -> dict[str, Any]:
+    return {
+        "ETF代码": code,
+        "ETF名称": name,
+        "交易日期": trade_date,
+        "ETF现价": None,
+        "MA周期": ma_period,
+        "MA名称": f"MA{ma_period}",
+        "MA": None,
+        "现价/MA": None,
+        "状态": status,
+        "说明": note,
+    }
+
+
+def calculate_one(
+    code: str,
+    name: str,
+    ma_period: int,
+    target_date: str,
+) -> dict[str, Any]:
     symbol = market_symbol(code)
+    ma_name = f"MA{ma_period}"
+
     try:
-        qfq_rows = fetch_qfq_daily_kline(symbol)
+        qfq_rows = fetch_qfq_daily_kline(symbol, ma_period)
         latest = qfq_rows[-1]
 
         if latest.date != target_date:
-            return {
-                "ETF代码": code,
-                "ETF名称": name,
-                "交易日期": latest.date,
-                "ETF现价": None,
-                "MA120": None,
-                "现价/MA120": None,
-                "状态": "not_updated",
-                "说明": (
+            return empty_result(
+                code,
+                name,
+                ma_period,
+                latest.date,
+                "not_updated",
+                (
                     f"最新K线日期为{latest.date}，目标日期为{target_date}；"
                     "可能为休市日或盘后数据尚未更新"
                 ),
-            }
+            )
 
-        recent_120 = qfq_rows[-120:]
+        recent_rows = qfq_rows[-ma_period:]
         kline_close = latest.close
-        ma120 = sum((row.close for row in recent_120), Decimal("0")) / Decimal("120")
+        ma_value = (
+            sum((row.close for row in recent_rows), Decimal("0"))
+            / Decimal(ma_period)
+        )
 
         quote_price, quote_date, quote_note = fetch_tencent_quote(symbol)
         final_close = kline_close
         notes = [
-            "MA120采用腾讯财经最近120个交易日前复权收盘价算术平均值",
-            "前复权序列最新一日价格作为当日收盘价主值",
+            f"{ma_name}采用腾讯财经最近{ma_period}个交易日前复权收盘价算术平均值"
         ]
 
         if quote_price is not None and quote_date == target_date:
             difference = abs(quote_price - kline_close)
+            final_close = quote_price
             if difference <= Decimal("0.001"):
-                final_close = quote_price
-                notes.append("腾讯实时快照与K线末日收盘价一致，采用快照价")
+                notes.append("腾讯实时快照与K线末日收盘价一致，采用实时快照价")
             else:
                 notes.append(
-                    f"腾讯快照价{round4(quote_price)}与K线价{round4(kline_close)}"
-                    f"相差{round4(difference)}，最终采用K线收盘价"
+                    f"腾讯实时快照价{round4(quote_price)}与日K收盘价"
+                    f"{round4(kline_close)}相差{round4(difference)}，"
+                    f"最终采用实时快照价{round4(quote_price)}"
                 )
+        elif quote_price is not None:
+            notes.append(
+                f"腾讯快照日期{quote_date or '未知'}与目标日期{target_date}不一致，"
+                f"最终采用日K收盘价{round4(kline_close)}"
+            )
         else:
-            notes.append(quote_note)
+            notes.append(
+                f"{quote_note}；最终采用日K收盘价{round4(kline_close)}"
+            )
 
-        ratio = final_close / ma120
+        ratio = final_close / ma_value
 
         return {
             "ETF代码": code,
             "ETF名称": name,
             "交易日期": target_date,
             "ETF现价": float(round4(final_close)),
-            "MA120": float(round4(ma120)),
-            "现价/MA120": float(round4(ratio)),
+            "MA周期": ma_period,
+            "MA名称": ma_name,
+            "MA": float(round4(ma_value)),
+            "现价/MA": float(round4(ratio)),
             "状态": "ok",
             "说明": "；".join(notes),
         }
 
     except Exception as exc:
-        return {
-            "ETF代码": code,
-            "ETF名称": name,
-            "交易日期": None,
-            "ETF现价": None,
-            "MA120": None,
-            "现价/MA120": None,
-            "状态": "error",
-            "说明": f"{type(exc).__name__}: {exc}",
-        }
+        return empty_result(
+            code,
+            name,
+            ma_period,
+            None,
+            "error",
+            f"{type(exc).__name__}: {exc}",
+        )
 
 
 def write_outputs(results: list[dict[str, Any]], target_date: str) -> None:
     success = [item for item in results if item["状态"] == "ok"]
     failed = [item for item in results if item["状态"] != "ok"]
-    success.sort(key=lambda item: item["现价/MA120"])
-    ordered = success + failed
 
+    # results已按ETFS固定顺序生成，不再按现价/MA排序。
+    ordered = results
     generated_at = datetime.now(BEIJING_TZ).isoformat(timespec="seconds")
     payload = {
         "交易日期": target_date,
         "生成时间": generated_at,
-        "数据来源": "腾讯财经前复权日K线；腾讯实时快照用于收盘价复核",
+        "数据来源": "腾讯财经前复权日K线；腾讯实时快照用于最终现价",
         "计算口径": (
-            "ETF现价优先采用与日K一致的腾讯实时快照收盘价；"
-            "MA120采用截至当日最近120个交易日前复权收盘价的算术平均值"
+            "ETF现价优先采用与交易日期一致的腾讯实时快照价；"
+            "各ETF按预设周期采用截至当日最近N个交易日前复权收盘价的算术平均值"
         ),
+        "均线配置": {
+            code: f"MA{ma_period}" for code, _, ma_period in ETFS
+        },
         "成功数量": len(success),
         "失败数量": len(failed),
         "data": ordered,
@@ -273,8 +307,10 @@ def write_outputs(results: list[dict[str, Any]], target_date: str) -> None:
         "ETF名称",
         "交易日期",
         "ETF现价",
-        "MA120",
-        "现价/MA120",
+        "MA周期",
+        "MA名称",
+        "MA",
+        "现价/MA",
         "状态",
         "说明",
     ]
@@ -300,7 +336,10 @@ def main() -> int:
         print("今天是周末，不执行行情写入。")
         return 0
 
-    results = [calculate_one(code, name, target_date) for code, name in ETFS]
+    results = [
+        calculate_one(code, name, ma_period, target_date)
+        for code, name, ma_period in ETFS
+    ]
     success_count = sum(item["状态"] == "ok" for item in results)
     error_count = sum(item["状态"] == "error" for item in results)
 
